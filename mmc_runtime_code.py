@@ -55,9 +55,9 @@ def u_exact(t, X):  # (N+1) x 1, (N+1) x D
     return np.exp((r + sigma_max ** 2) * (T - t)) * np.sum(X ** 2, 1, keepdims=True)  # (N+1) x 1
 
 
-def run_model(model, N_Iter, learning_rate, L, h_Factor, fixed=0, seed=42, modelTitle=""):
-
-    os.mkdir("./data/"+modelTitle+"/seed"+str(seed))
+def run_model(model, N_Iter, learning_rate, L, h_Factor, fixed=0, seed=42, modelTitle="", onlyRelativeError=False):
+    if not onlyRelativeError:
+        os.mkdir("./D"+str(D)+"/data/"+modelTitle+"/seed"+str(seed))
 
     tot = time.time()
     samples = 5
@@ -89,7 +89,7 @@ def run_model(model, N_Iter, learning_rate, L, h_Factor, fixed=0, seed=42, model
     plt.yscale("log")
     plt.title('Evolution of the training loss')
     # plt.title('Evolution of the training loss')
-    plt.savefig("./data/"+modelTitle+"/seed"+str(seed)+"/"+str(D) + '-dimensional Black-Scholes-Barenblatt loss, ' + modelTitle, bbox_inches='tight')
+    plt.savefig("./D"+str(D)+"/data/"+modelTitle+"/seed"+str(seed)+"/"+str(D) + '-dimensional Black-Scholes-Barenblatt loss, ' + modelTitle, bbox_inches='tight')
     minLoss = min(graph[1])
 
 
@@ -109,12 +109,11 @@ def run_model(model, N_Iter, learning_rate, L, h_Factor, fixed=0, seed=42, model
     plt.title(str(D) + '-dimensional Black-Scholes-Barenblatt paths, ' + modelTitle)
     # plt.legend()
     plt.legend(bbox_to_anchor=(1.02, 1.02))
-    plt.savefig("./data/"+modelTitle+"/seed"+str(seed)+"/"+str(D) + '-dimensional Black-Scholes-Barenblatt paths, ' + modelTitle, bbox_inches='tight')
+    plt.savefig("./D"+str(D)+"/data/"+modelTitle+"/seed"+str(seed)+"/"+str(D) + '-dimensional Black-Scholes-Barenblatt paths, ' + modelTitle, bbox_inches='tight')
 
     errors = np.sqrt((Y_test - Y_pred) ** 2 / Y_test ** 2)
-    mean_errors = np.mean(errors, 0)
+    mean_errors = np.mean(errors, 0) #average across all the batches for each timestamp (number of timesteps constant since validation timesteps)
     std_errors = np.std(errors, 0)
-
     plt.figure()
     plt.plot(t_test[0, :, 0], mean_errors, 'b', label='mean')
     plt.plot(t_test[0, :, 0], mean_errors + 2 * std_errors, 'r--', label='mean + two standard deviations')
@@ -124,13 +123,18 @@ def run_model(model, N_Iter, learning_rate, L, h_Factor, fixed=0, seed=42, model
     # plt.legend()
     # plt.savefig(str(D) + '-dimensional Black-Scholes-Barenblatt, ' + model.mode + "-" + model.activation)
     plt.legend(bbox_to_anchor=(1.02, 1.02))
-    plt.savefig("./data/"+modelTitle+"/seed"+str(seed)+"/"+str(D) + '-dimensional Black-Scholes-Barenblatt, ' + modelTitle, bbox_inches='tight')
+    plt.savefig("./D"+str(D)+"/data/"+modelTitle+"/seed"+str(seed)+"/"+str(D) + '-dimensional Black-Scholes-Barenblatt, ' + modelTitle, bbox_inches='tight')
     
-    return {"runtime":time.time() - tot,"minLoss":minLoss}
+    #save stats into a text file in each seed run
+    np.savez(os.path.join(os.path.join(os.path.join(os.path.join(os.path.dirname(__file__),"D{}/data".format(D)),modelTitle),"seed"+str(seed)), "reltiveErrors.npz"), meanRelativeError=mean_errors,stdRelativeError=std_errors)
+
+    return {"runtime":time.time() - tot,"minLoss":minLoss, "meanRelativeError": mean_errors, "stdRelativeError": std_errors}
 
 
 if __name__ == "__main__":
-    tot = time.time()
+    onlyRelativeError = True
+
+
     M = 10  # number of trajectories (batch size)
       #in the paper, M = 100
     N = 50  # number of time snapshots
@@ -158,29 +162,53 @@ if __name__ == "__main__":
             for h_Factor in h_Factor_arr:
                 runTimes = []
                 minLosses = []
+                meanRelativeErrors = None
+                stdRelativeErrors = None
                 modelTitle = model.mode + "_" + model.activation + "_iters-"+str(iterations)+"_L-"+str(L)+"_hFactor-"+str(h_Factor)
-                try:
-                    os.mkdir(os.path.join(os.path.join(os.path.dirname(__file__),"data"),modelTitle))
-                except FileExistsError:
-                    print("model aleady exists")
-                    continue
+                if not onlyRelativeError:
+                    try:
+                        os.mkdir(os.path.join(os.path.join(os.path.dirname(__file__),"D{}/data".format(D)),modelTitle))
+                    except FileExistsError:
+                        print("model aleady exists")
+                        continue
 
                 for seed in seeds:
-                    modelDict = run_model(model, iterations, learning_rate, L, h_Factor, seed=seed, modelTitle=modelTitle)
+                    modelDict = run_model(model, iterations, learning_rate, L, h_Factor, seed=seed, modelTitle=modelTitle, onlyRelativeError=onlyRelativeError)
                     if modelDict == None: continue
                     runtime,minLoss = modelDict['runtime'],modelDict['minLoss']
+                    meanRelativeError,stdRelativeError = modelDict['meanRelativeError'], modelDict['stdRelativeError']
                     runTimes.append(runtime)
                     minLosses.append(minLoss)
+                    
+                    if meanRelativeErrors is None: 
+                        meanRelativeErrors = np.copy(meanRelativeError)
+                        stdRelativeErrors = np.copy(stdRelativeError)
+                    else:
+                        meanRelativeErrors = np.append(meanRelativeErrors, meanRelativeError, axis=1)
+                        stdRelativeErrors = np.append(stdRelativeErrors, stdRelativeError, axis=1)
+
                 runTimeAvg = float(sum(runTimes))/len(runTimes)
                 minLossesAvg = float(sum(minLosses))/len(minLosses)
+                meanRelativeErrors = np.average(meanRelativeErrors, axis=1)
+                stdRelativeErrors = np.average(stdRelativeErrors, axis=1)
 
-                with open('model_trainTime_minLoss.txt', 'a') as f:
-                    f.writelines(modelTitle + ": " + str(runTimeAvg)+", "+str(str(minLossesAvg))+"\n")
-                
-    L_arr = [4]
-    h_Factor_arr = [3,4,5]
-    runMLMC([4], [3,4,5])
-    runMLMC([6,7], [3])
+                if not onlyRelativeError:
+                    with open('./D{}/model_trainTime_minLoss.txt'.format(D), 'a') as f:
+                        f.writelines(modelTitle + ": " + str(runTimeAvg)+", "+str(str(minLossesAvg))+"\n")
+
+                def writeRelErr(txtFileName, relErrors):
+                    f = open(os.path.join(os.path.join(os.path.join(os.path.dirname(__file__),"D{}/data".format(D)),modelTitle),txtFileName), "w+")
+                    f.write(str(relErrors))
+                    f.close()
+                writeRelErr("meanRelativeErrors.txt", meanRelativeErrors)
+                writeRelErr("stdRelativeErrors.txt", stdRelativeErrors)
+
+
+    L_arr = [1]
+    h_Factor_arr = [2]
+    #l , h_factor
+    runMLMC(L_arr, h_Factor_arr)
+    #runMLMC([6], [2,3])
 
     
 #the number of iterations and learning rate are the same as the Raissi Paper for the first go around

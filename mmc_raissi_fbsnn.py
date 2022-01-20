@@ -284,7 +284,7 @@ class FBSNN(ABC):
         plt.xlabel("epoch")
         plt.ylabel("time(seconds)")
         plt.title("Time Per Epoch for "+modelTitle+"_seed-"+str(seed))
-        plt.savefig("./data/"+modelTitle+"/seed"+str(seed)+"/TimePerEpoch_"+modelTitle+"_seed-"+str(seed))
+        plt.savefig("./D{}/data/".format(self.D)+modelTitle+"/seed"+str(seed)+"/TimePerEpoch_"+modelTitle+"_seed-"+str(seed))
         print("Number of layers arr", numLayers)
         return graph
 
