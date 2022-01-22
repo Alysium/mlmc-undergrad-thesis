@@ -132,7 +132,7 @@ def run_model(model, N_Iter, learning_rate, L, h_Factor, fixed=0, seed=42, model
 
 
 if __name__ == "__main__":
-    onlyRelativeError = True
+    onlyRelativeError = False
 
 
     M = 10  # number of trajectories (batch size)
@@ -205,10 +205,10 @@ if __name__ == "__main__":
 
 
     L_arr = [1]
-    h_Factor_arr = [2]
+    h_Factor_arr = [5,10,15,20,25,30,35,40,50,60,75,85,100]
     #l , h_factor
+    # runMLMC(L_arr, h_Factor_arr)
     runMLMC(L_arr, h_Factor_arr)
-    #runMLMC([6], [2,3])
 
     
 #the number of iterations and learning rate are the same as the Raissi Paper for the first go around
