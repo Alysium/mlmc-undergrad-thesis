@@ -1,7 +1,10 @@
 import numpy as np
 from abc import ABC, abstractmethod
+
+from sqlalchemy import null
 from mmc_raissi_nn_model import Sine, Resnet, VerletNet, SDEnet, LSTM
 import time
+import utils
 
 import torch
 import torch.nn as nn
@@ -11,7 +14,7 @@ import matplotlib.pyplot as plt
 
 
 class FBSNN(ABC):
-    def __init__(self, Xi, T, M, N, D, layers, mode, activation):
+    def __init__(self, Xi, T, M, N, D, layers, mode, activation, seed):
         device_idx = 0
         if torch.cuda.is_available():
             self.device = torch.device("cuda:" + str(device_idx) if torch.cuda.is_available() else "cpu")
@@ -20,10 +23,12 @@ class FBSNN(ABC):
             self.device = torch.device("cpu")
 
         #  We set a random seed to ensure that your results are reproducible
-        # torch.manual_seed(0)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
         self.Xi = torch.from_numpy(Xi).float().to(self.device)  # initial point
         self.Xi.requires_grad = True
+        self.Xi_numpy = np.copy(Xi)
 
         self.T = T  # terminal time
         self.M = M  # number of trajectories
@@ -58,7 +63,6 @@ class FBSNN(ABC):
             self.model = LSTM(layers, stable=True, activation=self.activation_function).to(self.device)
 
         self.model.apply(self.weights_init)
-        #print(self.model)
 
         # Record the loss
 
@@ -86,6 +90,7 @@ class FBSNN(ABC):
                                  retain_graph=True, create_graph=True)[0]  # M x D
         return Dg
 
+    #performs one iteration to predict option price Y from underlying asset X
     def loss_function(self, t, W, Xi):
         loss = 0
         X_list = []
@@ -105,9 +110,6 @@ class FBSNN(ABC):
         size = t.shape[1] #size = number of timestamps N
 
         for n in range(0, size-1): #iterates through the timestamps
-            # print(n)
-            # print(size)
-            # print(t)
             #specifies the current timestamp
             t1 = t[:, n + 1, :] 
             W1 = W[:, n + 1, :]
@@ -147,11 +149,11 @@ class FBSNN(ABC):
         #returns loss (scalar), X (vector of all the X's generated), Y (vector of all resulting Y's), Y0
         return loss, X, Y, Y[0, 0, 0]
 
-    def fetch_minibatch_train(self, size):  # Generate time + a Brownian motion
+    def fetch_minibatch(self, size=0):  # Generate time + a Brownian motion
         T = self.T
 
         M = self.M #number of samples that we are going to generate
-        N = size #number of timesteps that will be uised
+        N = size if size!=0 else self.N #number of timesteps that will be uised
         D = self.D #number of dimensions
 
         Dt = np.zeros((M, N + 1, 1))  # M x (N+1) x 1
@@ -170,33 +172,13 @@ class FBSNN(ABC):
 
         return t, W
 
-    def fetch_minibatch(self):  # Generate time + a Brownian motion
-        T = self.T
-
-        M = self.M
-        N = self.N
-        D = self.D
-
-        Dt = np.zeros((M, N + 1, 1))  # M x (N+1) x 1
-        DW = np.zeros((M, N + 1, D))  # M x (N+1) x D
-
-        dt = T / N
-
-        Dt[:, 1:, :] = dt
-        DW[:, 1:, :] = np.sqrt(dt) * np.random.normal(size=(M, N, D))
-
-        t = np.cumsum(Dt, axis=1)  # M x (N+1) x 1
-        W = np.cumsum(DW, axis=1)  # M x (N+1) x D
-        t = torch.from_numpy(t).float().to(self.device)
-        W = torch.from_numpy(W).float().to(self.device)
-
-        return t, W
-
-    def train(self, N_Iter, learning_rate, L, h_Factor, fixed=0, modelTitle="",seed=42):
+    def train(self, N_Iter, learning_rate, L, h_Factor, Xi, rel_error_threshold, rel_error_fixedIter, Nl, \
+            fixed=0, modelTitle=""):
         '''
           L = number of layers that will be performed
           h_Factor = factor in which each number of timesteps will be divided against
         '''
+
         loss_temp = np.array([])
 
         previous_it = 0
@@ -204,46 +186,20 @@ class FBSNN(ABC):
         #     previous_it = self.iteration[-1]
           
         #want to divide evently across the layers
-        layerIters = N_Iter // L
+        layerIters = N_Iter // L if Nl==0 else Nl
 
         # Optimizers
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
 
-        start_time = time.time()
         time_per_epoch = []
         
         numLayers = []
-        for it in range(previous_it, previous_it + N_Iter):
-            #size = number of time steps between [0,T]
-            #this is the point where multilayer monte carlo is used------
+        graph = None
+        start_time = time.time()
+        totalTimeSteps = 0
 
-            if fixed==0:
-              l = it//layerIters+1 #layers 1 to L
-              size = h_Factor**l       
-              if numLayers == [] or l != numLayers[-1][0]:
-                numLayers.append([l,size])   
-            else:
-              size = fixed
-
-
-
-            # if it < N_Iter/5:
-            #   size = 2
-            # elif N_Iter/5 <= it < (2*N_Iter)/5:
-            #   size = 4
-            # elif (2*N_Iter)/5 <= it < (3*N_Iter)/5:
-            #   size = 8
-            # elif (3*N_Iter)/5 <= it < (4*N_Iter)/5:
-            #   size = 16
-            # else:
-            #   size = 32
-            #------------------------------------------------------------
-
-            self.optimizer.zero_grad()
-
-            #this step fetches the samples of the number of timestamps that will be used
-            t_batch, W_batch = self.fetch_minibatch_train(size)  # M x (N+1) x 1, M x (N+1) x D
-            #---------------------------------------------------------------------------
+        def forward_backward(it):
+            nonlocal start_time, loss_temp, totalTimeSteps, Nl, numLayers, fixed
             '''
             The vectors are as:
             [M, N+1, 1] or [M, N+1, D]
@@ -254,6 +210,18 @@ class FBSNN(ABC):
               -> Brownian motion has 5 dimensions for 5 dimensional input
 
             '''
+            if fixed==0:
+              l = it//layerIters+1 #layers 1 to L
+              size = h_Factor**l       
+              if numLayers == [] or l != numLayers[-1][0]:
+                numLayers.append([l,size])   
+            else:
+              size = fixed
+              numLayers.append([size])
+            totalTimeSteps+=size
+            self.optimizer.zero_grad()
+            #this step fetches the samples of the number of timestamps that will be used for training
+            t_batch, W_batch = self.fetch_minibatch(size=size)  # M x (N+1) x 1, M x (N+1) x D
 
             loss, X_pred, Y_pred, Y0_pred = self.loss_function(t_batch, W_batch, self.Xi)
             self.optimizer.zero_grad()
@@ -261,16 +229,13 @@ class FBSNN(ABC):
             self.optimizer.step()
 
             loss_temp = np.append(loss_temp, loss.cpu().detach().numpy())
-
             # Print
-            
             if it % 100 == 0:
                 elapsed = time.time() - start_time
                 time_per_epoch.append(elapsed)
                 print('It: %d, Loss: %.3e, Y0: %.3f, Time: %.2f, Learning Rate: %.3e' %
                       (it, loss, Y0_pred, elapsed, learning_rate))
                 start_time = time.time()
-
 
             # Loss
             if it % 100 == 0:
@@ -280,20 +245,84 @@ class FBSNN(ABC):
                 self.iteration.append(it)
 
             graph = np.stack((self.iteration, self.training_loss))
-        plt.plot(list(np.linspace(0,N_Iter-100,int(N_Iter/100))), time_per_epoch)
-        plt.xlabel("epoch")
-        plt.ylabel("time(seconds)")
-        plt.title("Time Per Epoch for "+modelTitle+"_seed-"+str(seed))
-        plt.savefig("./D{}/data/".format(self.D)+modelTitle+"/seed"+str(seed)+"/TimePerEpoch_"+modelTitle+"_seed-"+str(seed))
-        print("Number of layers arr", numLayers)
-        return graph
+            return graph
+        
+        it=0
+        if rel_error_threshold == float('inf'):
+            it = previous_it
+            while it < previous_it + N_Iter:
+                #size = number of time steps between [0,T]
+                #this is the point where multilayer monte carlo is used------
+                graph = forward_backward(it)
+                it+=1
+        else:
+            it = 0
+            rel_error = float('inf')
+            while rel_error > rel_error_threshold:
+                graph = forward_backward(it)
+                if it > rel_error_fixedIter:
+                    mean_relative_errors,std_relative_errors,rel_error = self.validation_relative_error(Xi)
+                    # print("Mean relative erros:", mean_relative_errors)
+                    if (it % 200==0): print("rel_error: ", rel_error)
+
+                it+=1
+            if type(numLayers)==int: print(it + " iterations of size " + numLayers)
+            else: print("numLayers: " , numLayers)
+        # time per epoch graph-----------------------------------------------------
+        # plt.plot(list(np.linspace(0,N_Iter-100,int(N_Iter/100))), time_per_epoch)
+        # plt.xlabel("epoch")
+        # plt.ylabel("time(seconds)")
+        # plt.title("Time Per Epoch for "+modelTitle+"_seed-"+str(seed))
+        # plt.savefig(utils.get_D_data_model(self.D,modelTitle, seed=seed)+"/TimePerEpoch_{0}_seed-{1}".format(modelTitle,seed))
+        # -------------------------------------------------------------------------
+        return graph, totalTimeSteps
+
+    def validation_relative_error(self,Xi):
+        t_val, W_val = self.fetch_minibatch()
+        X_pred, Y_pred = self.predict(Xi, t_val, W_val)
+
+        if type(t_val).__module__ != 'numpy':
+            t_val = t_val.cpu().numpy()
+        if type(X_pred).__module__ != 'numpy':
+            X_pred = X_pred.cpu().detach().numpy()
+        if type(Y_pred).__module__ != 'numpy':
+            Y_pred = Y_pred.cpu().detach().numpy()
+        Y_val = self.exact_y(t_val, X_pred)
+        # Y_val = np.reshape(self.u_exact(np.reshape(t_val[0:self.M, :, :], [-1, 1]), np.reshape(X_pred[0:self.M, :, :], [-1, self.D])),
+        #             [self.M, -1, 1])
+
+        #Y_val and Y_pred shape: [M, N+1, 1] -> [batch size, number of timesnaps, 1]
+        relative_errors = self.relative_error(Y_val,Y_pred)
+        #average across all the batches for each timestamp (number of timesteps constant since validation timesteps)
+        mean_relative_errors = np.mean(relative_errors, 0)
+        std_relative_errors = np.std(relative_errors,0)
+        #shape is now [N+1,1]
+        batch_averaged_mean_relative_error = np.mean(mean_relative_errors,0)[0] 
+        #batch_averaged_mean_relative_error is a scalar float
+        #returns relative error averaged across batches and a single relative error value
+        return mean_relative_errors, std_relative_errors, batch_averaged_mean_relative_error
 
     def predict(self, Xi_star, t_star, W_star):
         Xi_star = torch.from_numpy(Xi_star).float().to(self.device)
         Xi_star.requires_grad = True
         loss, X_star, Y_star, Y0_pred = self.loss_function(t_star, W_star, Xi_star)
-
         return X_star, Y_star
+
+    def relative_error(self, Y_actual, Y_pred):
+        return np.sqrt((Y_actual - Y_pred) ** 2 / Y_actual ** 2)
+
+    def u_exact(self, t, X):  # (N+1) x 1, (N+1) x D
+        r = 0.05
+        sigma_max = 0.4
+        return np.exp((r + sigma_max ** 2) * (self.T - t)) * np.sum(X ** 2, 1, keepdims=True)  # (N+1) x 1
+
+    def exact_y(self, t, X_pred):
+        return np.reshape(
+            self.u_exact(
+                np.reshape(t[0:self.M, :, :], [-1, 1]), 
+                np.reshape(X_pred[0:self.M, :, :], [-1, self.D])),
+            [self.M, -1, 1]
+        )
 
     ###########################################################################
     ############################# Change Here! ################################
